@@ -1,6 +1,6 @@
 [package]
 name = "sayiiwhat"
-version = "0.1.1"
+version = "0.2.0"
 description = "Local video subtitle generator with OpenAI-compatible translation."
 authors = ["sayiiwhat"]
 edition = "2021"
