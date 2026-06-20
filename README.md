@@ -146,7 +146,7 @@ Tauri 会生成基础 `.app` 和初始 bundle。当前配置里的 bundle resour
 
 ```text
 apps/desktop/src-tauri/target/release/bundle/macos/sayiiwhat.app
-apps/desktop/src-tauri/target/release/bundle/macos/sayiiwhat_0.1.0_aarch64.dmg
+apps/desktop/src-tauri/target/release/bundle/macos/sayiiwhat_<version>_<arch>.dmg
 ```
 
 ### 一条命令打包 macOS 产物
