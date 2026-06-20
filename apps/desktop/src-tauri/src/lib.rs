@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, RwLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::{
@@ -62,6 +62,8 @@ const DEFAULT_TARGET_LANGUAGE: &str = "简体中文";
 const DEFAULT_SYSTEM_PROMPT: &str = "你是专业影视字幕译审。请把 Whisper 识别出的字幕翻译/润色为用户指定的目标语言；结合上下文修正明显断句、大小写和轻微识别错误。译文要口语、简短、适合屏幕阅读，不添加解释。";
 const DEFAULT_USER_TEMPLATE: &str = "请处理下面字幕块。原文可能是 Whisper 支持的任意语言，请自动判断源语言，并翻译/润色为目标语言：{targetLanguage}。\n\n你需要同时做两件事：\n1. 结合上下文修正 Whisper 可能造成的半句、断句、大小写和轻微识别错误。\n2. 在不改变整体时间范围的前提下，生成更自然的最终目标语言字幕时间轴；可以合并相邻半句，也可以把过长译文拆成多条。\n\n时间轴规则：\n- 每条 cue 的 start/end 使用数字秒，必须位于输入字幕块的时间范围内。\n- cue 必须按时间递增，不能重叠。\n- 单条 cue 建议 1.2–6.5 秒，尽量不要超过 7 秒。\n- 不要让一句完整长句长时间停留在屏幕上；长句要拆成自然的 2–3 条短字幕。\n- 每条字幕应简短、口语、适合屏幕阅读。\n\n只返回严格 JSON，不要 Markdown，不要解释。格式：\n{\"cues\":[{\"source\":[1,2],\"start\":12.34,\"end\":15.67,\"text\":\"目标语言字幕\"}]}\n\n输入字幕：\n{items}";
 const BUNDLED_VAD_MODEL: &str = "ggml-silero-v6.2.0.bin";
+const TRANSLATION_MAX_ATTEMPTS: usize = 3;
+const TRANSLATION_MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -538,7 +540,7 @@ async fn process_video(app: AppHandle, state: State<'_, AppState>, request: Proc
             });
         }
         Err(error) => {
-            let message = error.to_string();
+            let message = format_anyhow_error(error);
             let _ = write_task_meta_at(&archive_root, &ArchivedTaskMeta {
                 id: id.clone(),
                 video_path: video_path.clone(),
@@ -557,7 +559,7 @@ async fn process_video(app: AppHandle, state: State<'_, AppState>, request: Proc
             });
         }
     }
-    result.map_err(|e| e.to_string())
+    result.map_err(|e| format_anyhow_error(&e))
 }
 
 async fn process_video_inner(app: AppHandle, archive_root: PathBuf, request: ProcessVideoRequest, handle: Arc<RunningTaskHandle>) -> Result<ProcessVideoResult> {
@@ -1166,6 +1168,7 @@ async fn translate_entries(
     let blocks = split_translation_blocks(&entries, config.batch_size);
     let total_batches = blocks.len().max(1);
     let mut translated_entries = Vec::new();
+    let mut last_translation_request_at: Option<Instant> = None;
     for (batch_index, (start, end)) in blocks.iter().copied().enumerate() {
         if *handle.cancel.borrow() {
             return Err(anyhow::Error::new(Cancelled));
@@ -1173,15 +1176,15 @@ async fn translate_entries(
         let progress = 0.72 + (batch_index as f32 / total_batches as f32) * 0.18;
         emit(app, id, "info", &format!("翻译并重排第 {}/{} 个字幕块", batch_index + 1, total_batches), progress);
         let block = &entries[start..end];
-        let mut cancel_rx = handle.cancel.subscribe();
-        let mut block_entries = tokio::select! {
-            r = openai_translate_layout(&client, config, block) => r.with_context(|| format!(
-                "翻译块 {}-{} 失败",
-                block.first().map(|e| e.index).unwrap_or(0),
-                block.last().map(|e| e.index).unwrap_or(0),
-            ))?,
-            _ = cancel_rx.changed() => return Err(anyhow::Error::new(Cancelled)),
-        };
+        let mut block_entries = translate_block_with_retries(
+            app,
+            id,
+            &client,
+            config,
+            block,
+            handle,
+            &mut last_translation_request_at,
+        ).await?;
         translated_entries.append(&mut block_entries);
     }
     let translated_entries = normalize_translated_entries(translated_entries);
@@ -1193,6 +1196,109 @@ async fn translate_entries(
 
 fn mock_translate_entries(entries: Vec<SubtitleEntry>) -> Vec<SubtitleEntry> {
     entries.into_iter()
+        .map(|mut entry| {
+            entry.translated = Some(entry.text.clone());
+            entry
+        })
+        .collect()
+}
+
+async fn translate_block_with_retries(
+    app: &AppHandle,
+    id: &str,
+    client: &reqwest::Client,
+    config: &TranslationConfig,
+    block: &[SubtitleEntry],
+    handle: &Arc<RunningTaskHandle>,
+    last_translation_request_at: &mut Option<Instant>,
+) -> Result<Vec<SubtitleEntry>> {
+    let first_index = block.first().map(|entry| entry.index).unwrap_or(0);
+    let last_index = block.last().map(|entry| entry.index).unwrap_or(0);
+    let mut last_error: Option<anyhow::Error> = None;
+
+    for attempt in 1..=TRANSLATION_MAX_ATTEMPTS {
+        check_cancelled(handle).await?;
+        wait_translation_rate_limit(app, id, handle, last_translation_request_at).await?;
+        if attempt > 1 {
+            emit(
+                app,
+                id,
+                "info",
+                &format!("翻译块 {first_index}-{last_index} 重试第 {attempt}/{TRANSLATION_MAX_ATTEMPTS} 次"),
+                0.0,
+            );
+        }
+
+        let mut cancel_rx = handle.cancel.subscribe();
+        let result = tokio::select! {
+            r = openai_translate_layout(client, config, block) => r,
+            _ = cancel_rx.changed() => return Err(anyhow::Error::new(Cancelled)),
+        };
+
+        match result {
+            Ok(entries) => return Ok(entries),
+            Err(error) => {
+                let message = format_anyhow_error(&error);
+                if attempt < TRANSLATION_MAX_ATTEMPTS {
+                    emit(
+                        app,
+                        id,
+                        "info",
+                        &format!("翻译块 {first_index}-{last_index} 第 {attempt}/{TRANSLATION_MAX_ATTEMPTS} 次失败：{message}"),
+                        0.0,
+                    );
+                }
+                last_error = Some(error);
+            }
+        }
+    }
+
+    let reason = last_error
+        .as_ref()
+        .map(format_anyhow_error)
+        .unwrap_or_else(|| "未知错误".into());
+    emit(
+        app,
+        id,
+        "info",
+        &format!("翻译块 {first_index}-{last_index} 连续失败 {TRANSLATION_MAX_ATTEMPTS} 次，已回退为原文：{reason}"),
+        0.0,
+    );
+    Ok(fallback_translation_entries(block))
+}
+
+async fn wait_translation_rate_limit(
+    app: &AppHandle,
+    id: &str,
+    handle: &Arc<RunningTaskHandle>,
+    last_translation_request_at: &mut Option<Instant>,
+) -> Result<()> {
+    if let Some(last_at) = *last_translation_request_at {
+        let elapsed = last_at.elapsed();
+        if elapsed < TRANSLATION_MIN_REQUEST_INTERVAL {
+            let wait_for = TRANSLATION_MIN_REQUEST_INTERVAL - elapsed;
+            emit(
+                app,
+                id,
+                "info",
+                &format!("翻译限流：等待 {:.1} 秒", wait_for.as_secs_f32()),
+                0.0,
+            );
+            let mut cancel_rx = handle.cancel.subscribe();
+            tokio::select! {
+                _ = tokio::time::sleep(wait_for) => {}
+                _ = cancel_rx.changed() => return Err(anyhow::Error::new(Cancelled)),
+            }
+        }
+    }
+    *last_translation_request_at = Some(Instant::now());
+    Ok(())
+}
+
+fn fallback_translation_entries(entries: &[SubtitleEntry]) -> Vec<SubtitleEntry> {
+    entries
+        .iter()
+        .cloned()
         .map(|mut entry| {
             entry.translated = Some(entry.text.clone());
             entry
@@ -1949,6 +2055,17 @@ fn to_string(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 
+fn format_anyhow_error(error: &anyhow::Error) -> String {
+    let mut parts = Vec::new();
+    for cause in error.chain() {
+        let text = cause.to_string();
+        if parts.last() != Some(&text) {
+            parts.push(text);
+        }
+    }
+    parts.join(": ")
+}
+
 #[allow(dead_code)]
 fn new_task_id() -> String {
     Uuid::new_v4().to_string()
@@ -2032,6 +2149,8 @@ mod tests {
         let model = std::env::var("SAYIIWHAT_TEST_MODEL").expect("SAYIIWHAT_TEST_MODEL missing");
 
         let config = TranslationConfig {
+            id: "real-api-smoke".into(),
+            name: "真实 API smoke test".into(),
             enabled: true,
             provider: TranslationProvider::OpenAiCompatible,
             base_url,
@@ -2044,6 +2163,10 @@ mod tests {
             system_prompt: DEFAULT_SYSTEM_PROMPT.into(),
             user_template: DEFAULT_USER_TEMPLATE.into(),
         };
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(config.timeout_seconds.max(10)))
+            .build()
+            .unwrap();
 
         let source = vec![
             SubtitleEntry { index: 1, start: 16.390, end: 20.839, text: "We are here today because of".into(), translated: None },
@@ -2051,7 +2174,7 @@ mod tests {
             SubtitleEntry { index: 3, start: 25.020, end: 28.500, text: "And it is. And yet it feels natural to us now.".into(), translated: None },
         ];
 
-        let out = openai_translate_layout(&config, &source).await.unwrap();
+        let out = openai_translate_layout(&client, &config, &source).await.unwrap();
         assert!(!out.is_empty());
         assert!(out.iter().all(|entry| entry.translated.as_deref().map(str::trim).is_some_and(|text| !text.is_empty())));
         assert!(out.iter().all(|entry| entry.end > entry.start));
@@ -2067,14 +2190,16 @@ mod tests {
         assert!(!srt.contains("We are here today because of"));
 
         let english_config = TranslationConfig {
+            id: "real-api-english".into(),
+            name: "真实 API English smoke test".into(),
             target_language: "English".into(),
-            ..config
+            ..config.clone()
         };
         let japanese_source = vec![
             SubtitleEntry { index: 1, start: 1.0, end: 3.4, text: "私はずっと一人で".into(), translated: None },
             SubtitleEntry { index: 2, start: 3.5, end: 6.2, text: "旅をしてきました。".into(), translated: None },
         ];
-        let english_out = openai_translate_layout(&english_config, &japanese_source).await.unwrap();
+        let english_out = openai_translate_layout(&client, &english_config, &japanese_source).await.unwrap();
         assert!(!english_out.is_empty());
         assert!(english_out.iter().all(|entry| entry.translated.as_deref().map(str::trim).is_some_and(|text| !text.is_empty())));
         assert!(english_out.iter().all(|entry| entry.end > entry.start));

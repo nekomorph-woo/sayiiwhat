@@ -19,11 +19,13 @@ fn main() -> Result<()> {
     let videos = args[1..].iter().map(PathBuf::from).collect::<Vec<_>>();
     let config = AppConfig {
         model_path: model.to_string_lossy().to_string(),
-        translation: sayiiwhat_lib::TranslationConfig {
+        translation: vec![sayiiwhat_lib::TranslationConfig {
+            id: "mock".into(),
+            name: "Mock".into(),
             enabled: true,
             provider: TranslationProvider::Mock,
             ..Default::default()
-        },
+        }],
         ..Default::default()
     };
 
@@ -86,7 +88,7 @@ fn process_one(config: &AppConfig, video: &Path) -> Result<()> {
 
     let json_text = fs::read_to_string(json_base.with_extension("json")).context("read whisper json")?;
     let mut entries = polish_subtitle_timing(dedupe_and_normalize(parse_whisper_json(&json_text, 0.0, None)?));
-    if config.translation.enabled && config.translation.provider == TranslationProvider::Mock {
+    if config.translation.iter().any(|item| item.enabled && item.provider == TranslationProvider::Mock) {
         for entry in &mut entries {
             entry.translated = Some(entry.text.clone());
         }
