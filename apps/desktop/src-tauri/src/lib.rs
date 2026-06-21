@@ -1230,6 +1230,7 @@ async fn translate_block_with_retries(
         }
 
         let mut cancel_rx = handle.cancel.subscribe();
+        check_cancelled(handle).await?;
         let result = tokio::select! {
             r = openai_translate_layout(client, config, block) => r,
             _ = cancel_rx.changed() => return Err(anyhow::Error::new(Cancelled)),
@@ -1285,6 +1286,7 @@ async fn wait_translation_rate_limit(
                 0.0,
             );
             let mut cancel_rx = handle.cancel.subscribe();
+            check_cancelled(handle).await?;
             tokio::select! {
                 _ = tokio::time::sleep(wait_for) => {}
                 _ = cancel_rx.changed() => return Err(anyhow::Error::new(Cancelled)),
@@ -1845,13 +1847,14 @@ async fn delete_archived_tasks(state: State<'_, AppState>, ids: Vec<String>) -> 
 }
 
 #[tauri::command]
-async fn cancel_task(state: State<'_, AppState>, id: String) -> Result<(), String> {
+async fn cancel_task(app: AppHandle, state: State<'_, AppState>, id: String) -> Result<(), String> {
     let handle = {
         let map = state.running.lock().await;
         map.get(&id).cloned()
     };
     let Some(handle) = handle else { return Ok(()) };
     let _ = handle.cancel.send(true);
+    emit(&app, &id, "info", "已收到中止请求，正在停止任务", 0.0);
     Ok(())
 }
 
@@ -2022,6 +2025,13 @@ async fn run_and_stream(
     }
 
     let mut cancel_rx = handle.cancel.subscribe();
+    if *handle.cancel.borrow() {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        let _ = stdout_task.await;
+        let _ = stderr_task.await;
+        return Err(anyhow::Error::new(Cancelled));
+    }
     let status = tokio::select! {
         r = child.wait() => r,
         _ = cancel_rx.changed() => {

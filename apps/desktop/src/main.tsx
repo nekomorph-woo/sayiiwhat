@@ -140,6 +140,7 @@ interface QueueTask {
   subtitleCount?: number;
   usedSegments?: number;
   error?: string;
+  cancelling?: boolean;
   logs: LogEntry[];
 }
 
@@ -598,7 +599,7 @@ function App() {
       while (true) {
         const next = tasksRef.current.find((task) => task.status === "queued");
         if (!next) break;
-        setTasks((current) => current.map((task) => task.id === next.id ? { ...task, status: "running", logs: [...task.logs, makeLog("开始处理")] } : task));
+        setTasks((current) => current.map((task) => task.id === next.id ? { ...task, status: "running", cancelling: false, logs: [...task.logs, makeLog("开始处理")] } : task));
         try {
           const result = await invoke<ProcessVideoResult>("process_video", {
             request: {
@@ -618,6 +619,7 @@ function App() {
             outputPath: result.outputPath,
             subtitleCount: result.subtitleCount,
             usedSegments: result.usedSegments,
+            cancelling: false,
             logs: [...task.logs, makeLog(`输出完成：${result.outputPath}`, "success")],
           } : task));
           await refreshArchived();
@@ -628,6 +630,7 @@ function App() {
             ...task,
             status: isCancelled ? "cancelled" : "failed",
             error: isCancelled ? undefined : message,
+            cancelling: false,
             logs: [...task.logs, makeLog(isCancelled ? "已中止" : `失败：${message}`, "info")],
           } : task));
           await refreshArchived();
@@ -644,11 +647,20 @@ function App() {
   };
 
   const cancelTask = useCallback(async (id: string) => {
+    setTasks((current) => current.map((task) => {
+      if (task.id !== id || task.status !== "running" || task.cancelling) return task;
+      return {
+        ...task,
+        cancelling: true,
+        logs: [...task.logs, makeLog("已发送中止请求，等待任务停止", "info")],
+      };
+    }));
     try {
       await invoke("cancel_task", { id });
     } catch (error) {
       setTasks((current) => current.map((task) => task.id === id ? {
         ...task,
+        cancelling: false,
         logs: [...task.logs, makeLog(`中止请求失败：${String(error)}`, "info")],
       } : task));
     }
@@ -1185,8 +1197,8 @@ function ActiveTaskCard({ task, latestLog, onViewLog, onCancel }: {
             </button>
           )}
           {onCancel && task.status === "running" && (
-            <button type="button" className="cancel-btn" onClick={onCancel} aria-label="中止当前任务">
-              中止
+            <button type="button" className="cancel-btn" onClick={onCancel} disabled={task.cancelling} aria-label="中止当前任务">
+              {task.cancelling ? "中止中…" : "中止"}
             </button>
           )}
         </div>
